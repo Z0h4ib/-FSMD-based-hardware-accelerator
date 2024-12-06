@@ -5,22 +5,21 @@ class Accelerator extends Module {
   val io = IO(new Bundle {
     val start = Input(Bool())
     val done = Output(Bool())
-
     val address = Output(UInt(16.W))
-    val dataRead = Input(UInt(32.W))
+    val dataRead = Input(UInt(8.W)) // Using 8-bit pixels
     val writeEnable = Output(Bool())
-    val dataWrite = Output(UInt(32.W))
+    val dataWrite = Output(UInt(8.W)) // Writing 8-bit pixels
   })
 
-  // State definitions
-  val sIdle :: sRead :: sProcess :: sWrite :: sUpdateCoords :: sDone :: Nil = Enum(6)
+  // State Definitions
+  val sIdle :: sLoadRow :: sProcessPixel :: sWritePixel :: sUpdateCoords :: sDone :: Nil = Enum(6)
   val state = RegInit(sIdle)
 
   // Registers
-  val x = RegInit(0.U(5.W)) // X-coordinate (5 bits for 20 max)
-  val y = RegInit(0.U(5.W)) // Y-coordinate (5 bits for 20 max)
-  val inputPixel = Reg(UInt(32.W)) // Pixel being processed
-  val outputPixel = Reg(UInt(32.W)) // Processed pixel
+  val x = RegInit(0.U(5.W)) // X-coordinate
+  val y = RegInit(0.U(5.W)) // Y-coordinate
+  val rowBuffer = RegInit(VecInit(Seq.fill(3)(VecInit(Seq.fill(20)(255.U(8.W)))))) // Initialized as white (255)
+  val outputPixel = RegInit(255.U(8.W)) // Default to white (255)
 
   // Memory connections
   io.address := 0.U
@@ -28,66 +27,71 @@ class Accelerator extends Module {
   io.writeEnable := false.B
   io.done := false.B
 
-  // Helper function to calculate memory address
+  // Helper function for memory address calculation
   def addr(x: UInt, y: UInt): UInt = y * 20.U + x
 
-  // FSMD
   switch(state) {
     is(sIdle) {
       when(io.start) {
         x := 0.U
         y := 0.U
-        state := sRead
+        state := sLoadRow
       }
     }
 
-    is(sRead) {
-      io.address := addr(x, y) // Read pixel at current (x, y)
-      inputPixel := io.dataRead
-      state := sProcess
+    is(sLoadRow) {
+      // Shift rows in the buffer
+      when(x === 0.U) {
+        rowBuffer(0) := rowBuffer(1)
+        rowBuffer(1) := rowBuffer(2)
+      }
+      // Load the next row into the buffer
+      io.address := addr(x, y + 1.U)
+      rowBuffer(2)(x) := io.dataRead
+
+      when(x === 19.U) {
+        x := 0.U
+        state := sProcessPixel
+      }.otherwise {
+        x := x + 1.U
+      }
     }
 
-    is(sProcess) {
+    is(sProcessPixel) {
       when(x === 0.U || y === 0.U || x === 19.U || y === 19.U) {
-        // Border pixels are always set to black
+        // Border pixels are always black in the output
         outputPixel := 0.U
       }.otherwise {
-        // Check neighbors for inner pixels
-        val top = io.dataRead // Memory at (x, y-1)
-        val bottom = io.dataRead // Memory at (x, y+1)
-        val left = io.dataRead // Memory at (x-1, y)
-        val right = io.dataRead // Memory at (x+1, y)
+        // Access neighboring pixels
+        val top = rowBuffer(0)(x)
+        val bottom = rowBuffer(2)(x)
+        val left = rowBuffer(1)(Mux(x === 0.U, 0.U, x - 1.U)) // Prevent underflow
+        val right = rowBuffer(1)(Mux(x === 19.U, 19.U, x + 1.U)) // Prevent overflow
 
-        // Check erosion condition
-        when(inputPixel === 255.U && (top === 0.U || bottom === 0.U || left === 0.U || right === 0.U)) {
-          outputPixel := 0.U // Erode to black
-        }.otherwise {
-          outputPixel := 255.U // Remain white
-        }
+        // Apply erosion logic
+        val isEroded = (top === 0.U) || (bottom === 0.U) || (left === 0.U) || (right === 0.U)
+        outputPixel := Mux(isEroded, 0.U, 255.U)
       }
-      state := sWrite
+      state := sWritePixel
     }
 
-    is(sWrite) {
-      io.address := addr(x, y) + 400.U // Write to output address
+    is(sWritePixel) {
+      // Write the processed pixel to memory
+      io.address := addr(x, y) + 400.U // Offset output image
       io.dataWrite := outputPixel
       io.writeEnable := true.B
       state := sUpdateCoords
     }
 
     is(sUpdateCoords) {
-      // Update coordinates
+      io.writeEnable := false.B // Disable write to prevent spurious writes
       when(x === 19.U) {
         x := 0.U
         y := y + 1.U
+        state := Mux(y === 18.U, sDone, sLoadRow) // Stop loading rows after the last processable row
       }.otherwise {
         x := x + 1.U
-      }
-      // Check if finished
-      when(y === 19.U && x === 19.U) {
-        state := sDone
-      }.otherwise {
-        state := sRead
+        state := sProcessPixel
       }
     }
 
